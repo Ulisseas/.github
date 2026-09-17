@@ -12,6 +12,15 @@
 #     uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
 #     secrets: inherit
 #
+# `secrets: inherit` only crosses repositories inside the same organization
+# (or enterprise). A caller under a different owner, such as the private
+# nshazly/ulisseas-site, must pass the two secrets by name instead:
+#
+#     secrets:
+#       HONEYCOMB_INGEST_KEY: ${{ secrets.HONEYCOMB_INGEST_KEY }}
+#       GRAFANA_OTLP_TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
+#
+# Variables (vars.*) resolve from the caller either way.
 # Contract consumed by portfolio-infra (modules/honeycomb, modules/alerting,
 # modules/dashboards); change both sides together:
 #   spans:   cicd.pipeline.name, cicd.pipeline.result, cicd.pipeline.task.name,
@@ -29,6 +38,13 @@ on:
         type: string
         required: false
         default: ${{ github.run_id }}
+    secrets:
+      HONEYCOMB_INGEST_KEY:
+        description: Honeycomb ingest key for the github-ci environment.
+        required: true
+      GRAFANA_OTLP_TOKEN:
+        description: Grafana Cloud access-policy token with traces:write and metrics:write.
+        required: true
 
 permissions: {}
 
