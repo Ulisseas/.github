@@ -1,0 +1,18 @@
+# Exports every completed run of the listed workflows as OpenTelemetry traces
+# and CI metrics through the shared ci-telemetry workflow in ulisseas/.github.
+# Add other workflow display names to the list as the project grows.
+name: telemetry
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  export:
+    uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+    with:
+      run_id: ${{ github.event.workflow_run.id }}
+    secrets: inherit
