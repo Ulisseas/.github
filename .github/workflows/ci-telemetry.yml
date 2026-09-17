@@ -36,7 +36,17 @@
 #   spans:   cicd.pipeline.name, cicd.pipeline.result, cicd.pipeline.task.name,
 #            vcs.repository.name (added via extraAttributes), root span has no parent
 #   metrics: ci_workflow_duration_seconds, ci_workflow_result (gauges) with
-#            labels repo, workflow, branch, conclusion
+#            labels repo, workflow, branch, conclusion, version, deployed_version
+#
+# Version labels:
+#   version          the tag pointing at the run's head SHA ("v" stripped), or
+#                    empty. Only an exact match counts; an untagged commit is
+#                    not labelled with an ancestor's release.
+#   deployed_version what a deploy run actually shipped, read from an artifact
+#                    named `deployed-version` containing one line, if the run
+#                    uploaded one. Differs from `version` on a rollback. Empty
+#                    when absent. service.version on the spans is
+#                    deployed_version, else version, else the SHA.
 
 name: ci-telemetry
 
@@ -79,13 +89,63 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve run metadata and versions
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+            --jq '{name, head_branch, head_sha, conclusion, run_started_at, updated_at}' > run.json
+          name=$(jq -r .name run.json)
+          branch=$(jq -r .head_branch run.json)
+          sha=$(jq -r .head_sha run.json)
+          conclusion=$(jq -r .conclusion run.json)
+          start=$(jq -r .run_started_at run.json)
+          end=$(jq -r .updated_at run.json)
+          duration=$(( $(date -u -d "$end" +%s) - $(date -u -d "$start" +%s) ))
+
+          # version: a tag that points exactly at head_sha. Lightweight tags
+          # reference the commit directly; annotated tags reference a tag
+          # object whose target is the commit, so resolve both.
+          version=""
+          while read -r ref tsha ttype; do
+            [ -n "$ref" ] || continue
+            target="$tsha"
+            if [ "$ttype" = "tag" ]; then
+              target=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tsha}" --jq .object.sha 2>/dev/null || echo "")
+            fi
+            if [ "$target" = "$sha" ]; then version="${ref#refs/tags/}"; version="${version#v}"; break; fi
+          done < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" \
+                    --jq '.[] | "\(.ref) \(.object.sha) \(.object.type)"' 2>/dev/null)
+
+          # deployed_version: optional one-line artifact uploaded by a deploy run.
+          deployed=""
+          art_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+                    --jq '.artifacts[] | select(.name=="deployed-version" and .expired==false) | .id' | head -1)
+          if [ -n "$art_id" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${art_id}/zip" > dv.zip
+            deployed=$(unzip -p dv.zip | head -1 | tr -d '[:space:]')
+            deployed="${deployed#v}"
+          fi
+
+          # service.version for the spans: what shipped, else what was tagged, else the SHA.
+          svc_version="${deployed:-${version:-$sha}}"
+
+          {
+            echo "name=$name"; echo "branch=$branch"; echo "sha=$sha"
+            echo "conclusion=$conclusion"; echo "duration=$duration"
+            echo "version=$version"; echo "deployed_version=$deployed"
+            echo "service_version=$svc_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=${version:-<none>} deployed_version=${deployed:-<none>} service.version=$svc_version"
+
       - name: Export trace to Honeycomb
         uses: dash0hq/otel-cicd-action@895874bfae14f840e3032f1a14c3f2b45c93f4af # v4.1.1
         with:
           otlpEndpoint: grpc://api.honeycomb.io:443/
           otlpHeaders: x-honeycomb-team=${{ secrets.HONEYCOMB_INGEST_KEY }},x-honeycomb-dataset=${{ vars.HONEYCOMB_DATASET }}
           otelServiceName: ${{ vars.HONEYCOMB_DATASET }}
-          extraAttributes: vcs.repository.name=${{ github.repository }}
+          extraAttributes: vcs.repository.name=${{ github.repository }},service.version=${{ steps.run.outputs.service_version }}
           githubToken: ${{ github.token }}
           runId: ${{ env.RUN_ID }}
 
@@ -105,7 +165,7 @@ jobs:
           otlpEndpoint: ${{ vars.GRAFANA_OTLP_ENDPOINT }}/otlp/v1/traces
           otlpHeaders: Authorization=Basic ${{ steps.grafana.outputs.auth }}
           otelServiceName: ${{ vars.HONEYCOMB_DATASET }}
-          extraAttributes: vcs.repository.name=${{ github.repository }}
+          extraAttributes: vcs.repository.name=${{ github.repository }},service.version=${{ steps.run.outputs.service_version }}
           githubToken: ${{ github.token }}
           runId: ${{ env.RUN_ID }}
 
@@ -113,24 +173,6 @@ jobs:
       # alert rules in portfolio-infra read Prometheus gauges, so push those
       # through the same OTLP gateway (OTLP metrics -> Mimir; dots become
       # underscores, datapoint attributes become labels).
-      - name: Read run result
-        id: run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-            --jq '{name, head_branch, conclusion, run_started_at, updated_at}' > run.json
-          name=$(jq -r .name run.json)
-          branch=$(jq -r .head_branch run.json)
-          conclusion=$(jq -r .conclusion run.json)
-          start=$(jq -r .run_started_at run.json)
-          end=$(jq -r .updated_at run.json)
-          duration=$(( $(date -u -d "$end" +%s) - $(date -u -d "$start" +%s) ))
-          {
-            echo "name=$name"; echo "branch=$branch"
-            echo "conclusion=$conclusion"; echo "duration=$duration"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Push CI metrics to Grafana Cloud Metrics
         env:
           ENDPOINT: ${{ vars.GRAFANA_OTLP_ENDPOINT }}
@@ -140,13 +182,18 @@ jobs:
           BRANCH: ${{ steps.run.outputs.branch }}
           CONCLUSION: ${{ steps.run.outputs.conclusion }}
           DURATION: ${{ steps.run.outputs.duration }}
+          VERSION: ${{ steps.run.outputs.version }}
+          DEPLOYED_VERSION: ${{ steps.run.outputs.deployed_version }}
         run: |
           now=$(date -u +%s%N)
-          attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" --arg conclusion "$CONCLUSION" '
-            [ {key:"repo",       value:{stringValue:$repo}},
-              {key:"workflow",   value:{stringValue:$workflow}},
-              {key:"branch",     value:{stringValue:$branch}},
-              {key:"conclusion", value:{stringValue:$conclusion}} ]')
+          attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" \
+                        --arg conclusion "$CONCLUSION" --arg version "$VERSION" --arg deployed "$DEPLOYED_VERSION" '
+            [ {key:"repo",             value:{stringValue:$repo}},
+              {key:"workflow",         value:{stringValue:$workflow}},
+              {key:"branch",           value:{stringValue:$branch}},
+              {key:"conclusion",       value:{stringValue:$conclusion}},
+              {key:"version",          value:{stringValue:$version}},
+              {key:"deployed_version", value:{stringValue:$deployed}} ]')
           body=$(jq -cn --argjson attrs "$attrs" --arg now "$now" --arg dur "$DURATION" --arg svc "github-ci" '{
             resourceMetrics: [{
               resource: { attributes: [ {key:"service.name", value:{stringValue:$svc}} ] },
