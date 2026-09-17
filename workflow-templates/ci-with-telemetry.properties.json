@@ -1,6 +1,6 @@
 {
-  "name": "CI with telemetry",
-  "description": "Build on push and pull request, then export the run as OpenTelemetry traces and CI metrics via the shared ci-telemetry workflow.",
+  "name": "CI (pair with Telemetry export)",
+  "description": "Build on push and pull request, Pair with the Telemetry export template, which exports each completed run.",
   "iconName": "ci-with-telemetry",
   "categories": ["Continuous integration"],
   "filePatterns": []

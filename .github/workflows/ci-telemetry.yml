@@ -1,26 +1,36 @@
-# Reusable workflow: export the calling workflow run as OpenTelemetry spans to
+# Reusable workflow: export a completed workflow run as OpenTelemetry spans to
 # Honeycomb and Grafana Cloud Traces, and push two CI metrics to Grafana Cloud
 # Metrics. Provisioned by nshazly/portfolio-infra; the secrets and variables it
 # reads are written by that repo's bootstrap at org level (public repos) or at
 # repository level (private repos outside the org).
 #
-# Call it as the last job of any workflow:
+# Call it from a small `workflow_run` workflow in each repo, so the exported run
+# is already concluded (cicd.pipeline.result is derived from the run's
+# conclusion and is omitted while the run is in progress):
 #
-#   telemetry:
-#     if: always()
-#     needs: [build, deploy]      # every other job, so the run is complete
-#     uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
-#     secrets: inherit
+#   name: telemetry
+#   on:
+#     workflow_run:
+#       workflows: [CI, Release]     # the workflows to export, by display name
+#       types: [completed]
+#   permissions: {}
+#   jobs:
+#     export:
+#       uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+#       with:
+#         run_id: ${{ github.event.workflow_run.id }}
+#       secrets: inherit
 #
 # `secrets: inherit` only crosses repositories inside the same organization
 # (or enterprise). A caller under a different owner, such as the private
 # nshazly/ulisseas-site, must pass the two secrets by name instead:
 #
-#     secrets:
-#       HONEYCOMB_INGEST_KEY: ${{ secrets.HONEYCOMB_INGEST_KEY }}
-#       GRAFANA_OTLP_TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
+#       secrets:
+#         HONEYCOMB_INGEST_KEY: ${{ secrets.HONEYCOMB_INGEST_KEY }}
+#         GRAFANA_OTLP_TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
 #
 # Variables (vars.*) resolve from the caller either way.
+#
 # Contract consumed by portfolio-infra (modules/honeycomb, modules/alerting,
 # modules/dashboards); change both sides together:
 #   spans:   cicd.pipeline.name, cicd.pipeline.result, cicd.pipeline.task.name,
@@ -34,10 +44,9 @@ on:
   workflow_call:
     inputs:
       run_id:
-        description: Workflow run to export. Defaults to the calling run.
+        description: The completed workflow run to export (github.event.workflow_run.id from the caller).
         type: string
-        required: false
-        default: ${{ github.run_id }}
+        required: true
     secrets:
       HONEYCOMB_INGEST_KEY:
         description: Honeycomb ingest key for the github-ci environment.
@@ -52,8 +61,6 @@ jobs:
   export:
     name: telemetry
     runs-on: ubuntu-latest
-    # The calling run is still "in_progress" while this job executes, so the
-    # exporter waits for the other jobs to finish; keep this job last via needs.
     permissions:
       contents: read
       actions: read
@@ -62,6 +69,16 @@ jobs:
     env:
       RUN_ID: ${{ inputs.run_id }}
     steps:
+      - name: Require a completed run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .status)
+          if [ "$status" != "completed" ]; then
+            echo "::error::run ${RUN_ID} is '${status}', not completed; call this workflow from a workflow_run trigger"
+            exit 1
+          fi
+
       - name: Export trace to Honeycomb
         uses: dash0hq/otel-cicd-action@895874bfae14f840e3032f1a14c3f2b45c93f4af # v4.1.1
         with:
@@ -105,15 +122,10 @@ jobs:
             --jq '{name, head_branch, conclusion, run_started_at, updated_at}' > run.json
           name=$(jq -r .name run.json)
           branch=$(jq -r .head_branch run.json)
-          # Own jobs are still running from the API's point of view; derive the
-          # conclusion from the jobs this workflow waited on.
-          conclusion=$(jq -r '.conclusion // empty' run.json)
-          if [ -z "$conclusion" ]; then
-            conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
-              --jq '[.jobs[] | select(.name != "telemetry") | .conclusion] | if any(. == "failure" or . == "cancelled" or . == "timed_out") then "failure" else "success" end')
-          fi
+          conclusion=$(jq -r .conclusion run.json)
           start=$(jq -r .run_started_at run.json)
-          duration=$(( $(date -u +%s) - $(date -u -d "$start" +%s) ))
+          end=$(jq -r .updated_at run.json)
+          duration=$(( $(date -u -d "$end" +%s) - $(date -u -d "$start" +%s) ))
           {
             echo "name=$name"; echo "branch=$branch"
             echo "conclusion=$conclusion"; echo "duration=$duration"
