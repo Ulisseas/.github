@@ -8,6 +8,8 @@ Organization-wide defaults for `ulisseas/*` repositories.
 | `workflow-templates/` | Two starter workflows offered under **Actions → New workflow** in every org repo: `CI` (build) and `Telemetry export` (fires when CI completes and calls the reusable workflow). |
 | `profile/README.md` | The organization profile shown at github.com/ulisseas. |
 
+Every exported run carries two version labels on its metrics and sets `service.version` on its spans: `version` is the release tag pointing exactly at the run's commit (empty if untagged), and `deployed_version` is what a deploy run actually shipped, read from a one-line artifact named `deployed-version` if the run uploaded one. They differ on a rollback. Repos that tag releases get `version` for free; only deploying workflows need to upload the artifact.
+
 The credentials the reusable workflow reads (`HONEYCOMB_INGEST_KEY`, `GRAFANA_OTLP_TOKEN` and the `GRAFANA_OTLP_*` / `HONEYCOMB_DATASET` variables) are org-level Actions secrets and variables written by the private `portfolio-infra` repository's bootstrap. Public repos in this org inherit them; nothing needs to be configured per repo.
 
 Adding a repo: create it in the org, add the **Telemetry export** template and list the repo's workflow display names under `workflow_run.workflows`. See `portfolio-infra/docs/ONBOARDING.md` for the alerting and dashboard side.
