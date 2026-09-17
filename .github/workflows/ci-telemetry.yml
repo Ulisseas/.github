@@ -1,0 +1,140 @@
+# Reusable workflow: export the calling workflow run as OpenTelemetry spans to
+# Honeycomb and Grafana Cloud Traces, and push two CI metrics to Grafana Cloud
+# Metrics. Provisioned by nshazly/portfolio-infra; the secrets and variables it
+# reads are written by that repo's bootstrap at org level (public repos) or at
+# repository level (private repos outside the org).
+#
+# Call it as the last job of any workflow:
+#
+#   telemetry:
+#     if: always()
+#     needs: [build, deploy]      # every other job, so the run is complete
+#     uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+#     secrets: inherit
+#
+# Contract consumed by portfolio-infra (modules/honeycomb, modules/alerting,
+# modules/dashboards); change both sides together:
+#   spans:   cicd.pipeline.name, cicd.pipeline.result, cicd.pipeline.task.name,
+#            vcs.repository.name (added via extraAttributes), root span has no parent
+#   metrics: ci_workflow_duration_seconds, ci_workflow_result (gauges) with
+#            labels repo, workflow, branch, conclusion
+
+name: ci-telemetry
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: Workflow run to export. Defaults to the calling run.
+        type: string
+        required: false
+        default: ${{ github.run_id }}
+
+permissions: {}
+
+jobs:
+  export:
+    name: telemetry
+    runs-on: ubuntu-latest
+    # The calling run is still "in_progress" while this job executes, so the
+    # exporter waits for the other jobs to finish; keep this job last via needs.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      checks: read
+    env:
+      RUN_ID: ${{ inputs.run_id }}
+    steps:
+      - name: Export trace to Honeycomb
+        uses: dash0hq/otel-cicd-action@895874bfae14f840e3032f1a14c3f2b45c93f4af # v4.1.1
+        with:
+          otlpEndpoint: grpc://api.honeycomb.io:443/
+          otlpHeaders: x-honeycomb-team=${{ secrets.HONEYCOMB_INGEST_KEY }},x-honeycomb-dataset=${{ vars.HONEYCOMB_DATASET }}
+          otelServiceName: ${{ vars.HONEYCOMB_DATASET }}
+          extraAttributes: vcs.repository.name=${{ github.repository }}
+          githubToken: ${{ github.token }}
+          runId: ${{ env.RUN_ID }}
+
+      - name: Build Grafana OTLP auth header
+        id: grafana
+        env:
+          INSTANCE_ID: ${{ vars.GRAFANA_OTLP_INSTANCE_ID }}
+          TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
+        run: |
+          auth=$(printf '%s:%s' "$INSTANCE_ID" "$TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          echo "auth=$auth" >> "$GITHUB_OUTPUT"
+
+      - name: Export trace to Grafana Cloud Traces
+        uses: dash0hq/otel-cicd-action@895874bfae14f840e3032f1a14c3f2b45c93f4af # v4.1.1
+        with:
+          otlpEndpoint: ${{ vars.GRAFANA_OTLP_ENDPOINT }}/otlp/v1/traces
+          otlpHeaders: Authorization=Basic ${{ steps.grafana.outputs.auth }}
+          otelServiceName: ${{ vars.HONEYCOMB_DATASET }}
+          extraAttributes: vcs.repository.name=${{ github.repository }}
+          githubToken: ${{ github.token }}
+          runId: ${{ env.RUN_ID }}
+
+      # The exporter emits traces only. The Sites/CI dashboards and the two CI
+      # alert rules in portfolio-infra read Prometheus gauges, so push those
+      # through the same OTLP gateway (OTLP metrics -> Mimir; dots become
+      # underscores, datapoint attributes become labels).
+      - name: Read run result
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+            --jq '{name, head_branch, conclusion, run_started_at, updated_at}' > run.json
+          name=$(jq -r .name run.json)
+          branch=$(jq -r .head_branch run.json)
+          # Own jobs are still running from the API's point of view; derive the
+          # conclusion from the jobs this workflow waited on.
+          conclusion=$(jq -r '.conclusion // empty' run.json)
+          if [ -z "$conclusion" ]; then
+            conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+              --jq '[.jobs[] | select(.name != "telemetry") | .conclusion] | if any(. == "failure" or . == "cancelled" or . == "timed_out") then "failure" else "success" end')
+          fi
+          start=$(jq -r .run_started_at run.json)
+          duration=$(( $(date -u +%s) - $(date -u -d "$start" +%s) ))
+          {
+            echo "name=$name"; echo "branch=$branch"
+            echo "conclusion=$conclusion"; echo "duration=$duration"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push CI metrics to Grafana Cloud Metrics
+        env:
+          ENDPOINT: ${{ vars.GRAFANA_OTLP_ENDPOINT }}
+          AUTH: ${{ steps.grafana.outputs.auth }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ steps.run.outputs.name }}
+          BRANCH: ${{ steps.run.outputs.branch }}
+          CONCLUSION: ${{ steps.run.outputs.conclusion }}
+          DURATION: ${{ steps.run.outputs.duration }}
+        run: |
+          now=$(date -u +%s%N)
+          attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" --arg conclusion "$CONCLUSION" '
+            [ {key:"repo",       value:{stringValue:$repo}},
+              {key:"workflow",   value:{stringValue:$workflow}},
+              {key:"branch",     value:{stringValue:$branch}},
+              {key:"conclusion", value:{stringValue:$conclusion}} ]')
+          body=$(jq -cn --argjson attrs "$attrs" --arg now "$now" --arg dur "$DURATION" --arg svc "github-ci" '{
+            resourceMetrics: [{
+              resource: { attributes: [ {key:"service.name", value:{stringValue:$svc}} ] },
+              scopeMetrics: [{
+                scope: { name: "ulisseas/.github/ci-telemetry" },
+                metrics: [
+                  { name: "ci_workflow_duration_seconds",
+                    gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: ($dur|tonumber), attributes: $attrs } ] } },
+                  { name: "ci_workflow_result",
+                    gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: 1, attributes: $attrs } ] } }
+                ] }] }] }')
+          # Run logs on public repos are public: print the status code only.
+          # -s hides curl's own error text (which would include the gateway
+          # URL); the response body is never printed.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Basic $AUTH" -H 'Content-Type: application/json' \
+            --data "$body" "$ENDPOINT/otlp/v1/metrics" || echo 000)
+          echo "metrics push: HTTP $code"
+          case "$code" in 2??) ;; *) echo "::error::CI metrics push failed (HTTP $code)"; exit 1 ;; esac
