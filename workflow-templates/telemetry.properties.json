@@ -1,0 +1,7 @@
+{
+  "name": "Telemetry export",
+  "description": "Export completed CI runs as OpenTelemetry traces and CI metrics via the shared ci-telemetry workflow. Pair with the CI template.",
+  "iconName": "ci-with-telemetry",
+  "categories": ["Monitoring"],
+  "filePatterns": []
+}
