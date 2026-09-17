@@ -1,0 +1,26 @@
+# Starter workflow for ulisseas/* repositories: build, then export the run as
+# telemetry. Replace the build job with the project's real steps; keep the
+# telemetry job last and list every other job in its `needs`.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: echo "replace with the project's build and test steps"
+
+  telemetry:
+    if: always()
+    needs: [build]
+    uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+    secrets: inherit
