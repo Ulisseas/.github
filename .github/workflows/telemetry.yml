@@ -1,0 +1,28 @@
+# Exports every completed lint run of this repo through its own ci-telemetry
+# reusable workflow. Inside the org, so secrets: inherit works. A push to main
+# is this repo's deploy: every caller picks the new workflow up on its next
+# run, so the main SHA is uploaded as deployed-version by lint.yml.
+name: telemetry
+
+on:
+  workflow_run:
+    workflows: [lint]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: telemetry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  export:
+    uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      checks: read
+    with:
+      run_id: ${{ github.event.workflow_run.id }}
+    secrets: inherit
