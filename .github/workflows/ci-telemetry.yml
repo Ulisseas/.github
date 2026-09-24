@@ -1,5 +1,5 @@
 # Reusable workflow: export a completed workflow run as OpenTelemetry spans to
-# Honeycomb and Grafana Cloud Traces, and push two CI metrics to Grafana Cloud
+# Honeycomb and Grafana Cloud Traces, and push CI metrics to Grafana Cloud
 # Metrics. Provisioned by nshazly/portfolio-infra; the secrets and variables it
 # reads are written by that repo's bootstrap at org level (public repos) or at
 # repository level (private repos outside the org).
@@ -37,6 +37,16 @@
 #            vcs.repository.name (added via extraAttributes), root span has no parent
 #   metrics: ci_workflow_duration_seconds, ci_workflow_result (gauges) with
 #            labels repo, workflow, branch, conclusion, version, deployed_version
+#            ci_deploy_lead_time_seconds (gauge) with labels repo, workflow,
+#            branch, deployed_version; deploys only (see below)
+#
+# Lead time for changes (DORA): ci_deploy_lead_time_seconds = the run's
+# completion time (updated_at, the same end as the duration gauge) minus the
+# head commit's timestamp (head_commit.timestamp on the run, so no extra API
+# call). Emitted only for an actual deploy: conclusion == success and a
+# non-empty deployed_version. Skipped when the commit time is missing or the
+# difference is negative. For a change made of several commits this is a
+# lower bound, since only the newest commit's time is known.
 #
 # Version labels:
 #   version          the tag pointing at the run's head SHA ("v" stripped), or
@@ -95,7 +105,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-            --jq '{name, head_branch, head_sha, conclusion, run_started_at, updated_at}' > run.json
+            --jq '{name, head_branch, head_sha, conclusion, run_started_at, updated_at,
+                   commit_ts: .head_commit.timestamp}' > run.json
           name=$(jq -r .name run.json)
           branch=$(jq -r .head_branch run.json)
           sha=$(jq -r .head_sha run.json)
@@ -103,6 +114,7 @@ jobs:
           start=$(jq -r .run_started_at run.json)
           end=$(jq -r .updated_at run.json)
           duration=$(( $(date -u -d "$end" +%s) - $(date -u -d "$start" +%s) ))
+          commit_ts=$(jq -r '.commit_ts // empty' run.json)
 
           # version: a tag that points exactly at head_sha. Lightweight tags
           # reference the commit directly; annotated tags reference a tag
@@ -131,13 +143,23 @@ jobs:
           # service.version for the spans: what shipped, else what was tagged, else the SHA.
           svc_version="${deployed:-${version:-$sha}}"
 
+          # Lead time for changes: deploys only (success + deployed_version),
+          # and only when the head commit's time is known and not in the future.
+          lead_time=""
+          if [ "$conclusion" = "success" ] && [ -n "$deployed" ] && [ -n "$commit_ts" ]; then
+            if commit_s=$(date -u -d "$commit_ts" +%s 2>/dev/null); then
+              lt=$(( $(date -u -d "$end" +%s) - commit_s ))
+              if [ "$lt" -ge 0 ]; then lead_time="$lt"; fi
+            fi
+          fi
+
           {
             echo "name=$name"; echo "branch=$branch"; echo "sha=$sha"
             echo "conclusion=$conclusion"; echo "duration=$duration"
             echo "version=$version"; echo "deployed_version=$deployed"
-            echo "service_version=$svc_version"
+            echo "service_version=$svc_version"; echo "lead_time=$lead_time"
           } >> "$GITHUB_OUTPUT"
-          echo "version=${version:-<none>} deployed_version=${deployed:-<none>} service.version=$svc_version"
+          echo "version=${version:-<none>} deployed_version=${deployed:-<none>} service.version=$svc_version lead_time=${lead_time:-<none>}"
 
       - name: Export trace to Honeycomb
         uses: dash0hq/otel-cicd-action@895874bfae14f840e3032f1a14c3f2b45c93f4af # v4.1.1
@@ -169,10 +191,12 @@ jobs:
           githubToken: ${{ github.token }}
           runId: ${{ env.RUN_ID }}
 
-      # The exporter emits traces only. The Sites/CI dashboards and the two CI
-      # alert rules in portfolio-infra read Prometheus gauges, so push those
-      # through the same OTLP gateway (OTLP metrics -> Mimir; dots become
-      # underscores, datapoint attributes become labels).
+      # The exporter emits traces only. The Sites/CI/Releases dashboards and the
+      # two CI alert rules in portfolio-infra read Prometheus gauges, so push
+      # those through the same OTLP gateway (OTLP metrics -> Mimir; dots become
+      # underscores, datapoint attributes become labels). Metric names already
+      # carry their unit suffix and set no OTLP `unit`, so no suffix is added
+      # and each Prometheus name equals the OTLP name.
       - name: Push CI metrics to Grafana Cloud Metrics
         env:
           ENDPOINT: ${{ vars.GRAFANA_OTLP_ENDPOINT }}
@@ -184,6 +208,7 @@ jobs:
           DURATION: ${{ steps.run.outputs.duration }}
           VERSION: ${{ steps.run.outputs.version }}
           DEPLOYED_VERSION: ${{ steps.run.outputs.deployed_version }}
+          LEAD_TIME: ${{ steps.run.outputs.lead_time }}
         run: |
           now=$(date -u +%s%N)
           attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" \
@@ -194,17 +219,23 @@ jobs:
               {key:"conclusion",       value:{stringValue:$conclusion}},
               {key:"version",          value:{stringValue:$version}},
               {key:"deployed_version", value:{stringValue:$deployed}} ]')
-          body=$(jq -cn --argjson attrs "$attrs" --arg now "$now" --arg dur "$DURATION" --arg svc "github-ci" '{
+          # Lead time carries no conclusion (always success) or version label.
+          lt_attrs=$(jq -c '[ .[] | select(.key == "repo" or .key == "workflow" or .key == "branch" or .key == "deployed_version") ]' <<<"$attrs")
+          body=$(jq -cn --argjson attrs "$attrs" --argjson lt_attrs "$lt_attrs" --arg now "$now" \
+                        --arg dur "$DURATION" --arg lt "$LEAD_TIME" --arg svc "github-ci" '{
             resourceMetrics: [{
               resource: { attributes: [ {key:"service.name", value:{stringValue:$svc}} ] },
               scopeMetrics: [{
                 scope: { name: "ulisseas/.github/ci-telemetry" },
-                metrics: [
+                metrics: ([
                   { name: "ci_workflow_duration_seconds",
                     gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: ($dur|tonumber), attributes: $attrs } ] } },
                   { name: "ci_workflow_result",
                     gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: 1, attributes: $attrs } ] } }
-                ] }] }] }')
+                ] + (if $lt == "" then [] else [
+                  { name: "ci_deploy_lead_time_seconds",
+                    gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: ($lt|tonumber), attributes: $lt_attrs } ] } }
+                ] end)) }] }] }')
           # Run logs on public repos are public: print the status code only.
           # -s hides curl's own error text (which would include the gateway
           # URL); the response body is never printed.
