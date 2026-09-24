@@ -1,0 +1,80 @@
+name: Release
+
+# One run per push to main (i.e. every squash-merged PR). semantic-release
+# reads the conventional PR titles since the last tag and, when they warrant a
+# version (feat: minor, fix: patch, "!" or BREAKING CHANGE: major), tags vX.Y.Z
+# on the merge commit and publishes a GitHub release with generated notes.
+# Config: the "release" key in package.json. Nothing is committed back to main,
+# so contents:write on this job is enough and the protect-main ruleset needs no
+# bypass actor. docs:, ci:, chore: merges cut nothing.
+#
+# A release is this repo's deploy: callers pin ci-telemetry.yml by the release
+# commit's SHA (`@<sha> # vX.Y.Z`) and Dependabot proposes the bump in each
+# caller. The tag is uploaded as the deployed-version artifact, so the
+# Releases & DORA dashboard shows the version and counts a failed Release in
+# the change failure rate.
+on:
+  push:
+    branches: [main]
+
+# The workflow grants nothing by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # tag + GitHub release
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags + history
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: package.json
+          cache: npm
+      - name: Install
+        # --ignore-scripts skips `prepare: husky`; nothing here commits.
+        run: npm ci --ignore-scripts
+      - name: Release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # semantic-release exits 0 whether or not it released. Detect a release
+        # by the tag it creates locally before pushing it: any v* tag present
+        # after the run that was not present before.
+        run: |
+          git tag --list 'v*' | sort > "$RUNNER_TEMP/tags-before"
+          npx --no -- semantic-release
+          git tag --list 'v*' | sort > "$RUNNER_TEMP/tags-after"
+          tag=$(comm -13 "$RUNNER_TEMP/tags-before" "$RUNNER_TEMP/tags-after" | tail -n 1)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ -n "$tag" ]]; then echo "Released $tag"; else echo "No new version."; fi
+
+      - name: Record deployed version
+        # One line, read by this repo's telemetry workflow (ci-telemetry) as the
+        # deployed_version label. Only when a version was cut: a run that ships
+        # nothing must not claim to have deployed.
+        if: ${{ steps.release.outputs.tag != '' }}
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          printf '%s\n' "$TAG" > deployed-version
+          echo "deployed $TAG"
+      - name: Upload deployed version
+        if: ${{ steps.release.outputs.tag != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployed-version
+          path: deployed-version
+          retention-days: 7
+          if-no-files-found: error
