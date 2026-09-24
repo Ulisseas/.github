@@ -16,7 +16,8 @@
 #   permissions: {}
 #   jobs:
 #     export:
-#       uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+#       # pin a release by commit SHA; Dependabot proposes newer ones (README: Versions)
+#       uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@<commit sha> # vX.Y.Z
 #       with:
 #         run_id: ${{ github.event.workflow_run.id }}
 #       secrets: inherit

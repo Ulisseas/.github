@@ -1,0 +1,42 @@
+{
+  "name": "ulisseas-dotgithub",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Org profile, shared reusable workflows and starter templates. Released with semantic-release; callers pin a release by SHA.",
+  "engines": {
+    "node": "24.x"
+  },
+  "devDependencies": {
+    "conventional-changelog-conventionalcommits": "^9.3.1",
+    "semantic-release": "^25.0.9"
+  },
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "plugins": [
+      [
+        "@semantic-release/commit-analyzer",
+        {
+          "preset": "conventionalcommits"
+        }
+      ],
+      [
+        "@semantic-release/release-notes-generator",
+        {
+          "preset": "conventionalcommits"
+        }
+      ],
+      [
+        "@semantic-release/github",
+        {
+          "successComment": false,
+          "failComment": false,
+          "failTitle": false,
+          "releasedLabels": false
+        }
+      ]
+    ]
+  }
+}

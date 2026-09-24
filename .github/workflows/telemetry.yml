@@ -1,12 +1,12 @@
-# Exports every completed lint run of this repo through its own ci-telemetry
-# reusable workflow. Inside the org, so secrets: inherit works. A push to main
-# is this repo's deploy: every caller picks the new workflow up on its next
-# run, so the main SHA is uploaded as deployed-version by lint.yml.
+# Exports every completed lint and Release run of this repo through its own
+# ci-telemetry workflow, referenced locally so this repo always exports with
+# its current code (callers pin a release instead). Inside the org, so
+# secrets: inherit works. Release uploads the tag it cut as deployed-version.
 name: telemetry
 
 on:
   workflow_run:
-    workflows: [lint]
+    workflows: [lint, Release]
     types: [completed]
 
 permissions: {}
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   export:
-    uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@main
+    uses: ./.github/workflows/ci-telemetry.yml
     permissions:
       contents: read
       actions: read
