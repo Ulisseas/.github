@@ -36,7 +36,7 @@
 #   spans:   cicd.pipeline.name, cicd.pipeline.result, cicd.pipeline.task.name,
 #            vcs.repository.name (added via extraAttributes), root span has no parent
 #   metrics: ci_workflow_duration_seconds, ci_workflow_result (gauges) with
-#            labels repo, workflow, branch, conclusion, version, deployed_version
+#            labels repo, workflow, branch, event, conclusion, version, deployed_version
 #            ci_deploy_lead_time_seconds (gauge) with labels repo, workflow,
 #            branch, deployed_version; deploys only (see below)
 #
@@ -105,10 +105,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-            --jq '{name, head_branch, head_sha, conclusion, run_started_at, updated_at,
+            --jq '{name, event, head_branch, head_sha, conclusion, run_started_at, updated_at,
                    commit_ts: .head_commit.timestamp}' > run.json
           name=$(jq -r .name run.json)
           branch=$(jq -r .head_branch run.json)
+          event=$(jq -r .event run.json)
           sha=$(jq -r .head_sha run.json)
           conclusion=$(jq -r .conclusion run.json)
           start=$(jq -r .run_started_at run.json)
@@ -154,7 +155,7 @@ jobs:
           fi
 
           {
-            echo "name=$name"; echo "branch=$branch"; echo "sha=$sha"
+            echo "name=$name"; echo "branch=$branch"; echo "event=$event"; echo "sha=$sha"
             echo "conclusion=$conclusion"; echo "duration=$duration"
             echo "version=$version"; echo "deployed_version=$deployed"
             echo "service_version=$svc_version"; echo "lead_time=$lead_time"
@@ -204,6 +205,7 @@ jobs:
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ steps.run.outputs.name }}
           BRANCH: ${{ steps.run.outputs.branch }}
+          EVENT: ${{ steps.run.outputs.event }}
           CONCLUSION: ${{ steps.run.outputs.conclusion }}
           DURATION: ${{ steps.run.outputs.duration }}
           VERSION: ${{ steps.run.outputs.version }}
@@ -211,11 +213,12 @@ jobs:
           LEAD_TIME: ${{ steps.run.outputs.lead_time }}
         run: |
           now=$(date -u +%s%N)
-          attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" \
+          attrs=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" --arg event "$EVENT" \
                         --arg conclusion "$CONCLUSION" --arg version "$VERSION" --arg deployed "$DEPLOYED_VERSION" '
             [ {key:"repo",             value:{stringValue:$repo}},
               {key:"workflow",         value:{stringValue:$workflow}},
               {key:"branch",           value:{stringValue:$branch}},
+              {key:"event",            value:{stringValue:$event}},
               {key:"conclusion",       value:{stringValue:$conclusion}},
               {key:"version",          value:{stringValue:$version}},
               {key:"deployed_version", value:{stringValue:$deployed}} ]')
