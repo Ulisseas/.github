@@ -2,10 +2,11 @@
 # One-shot (idempotent) hardening of the ulisseas/.github repository.
 #
 # This repo is the org's shared surface: every ulisseas/* repo (and the private
-# ulisseas-site under nshazly) runs .github/workflows/ci-telemetry.yml@main with
-# its own telemetry secrets in scope. Whatever lands on main here executes in
-# every caller on its next run, so main must only change through a reviewed PR
-# with the lint check green. Modelled on portfolio-infra/scripts/harden-repo.sh
+# ulisseas-site under nshazly) runs a released .github/workflows/ci-telemetry.yml,
+# pinned by commit SHA, with its own telemetry secrets in scope. Whatever is
+# released from main here executes in every caller once its Dependabot bump
+# merges, so main must only change through a reviewed PR with the lint check
+# green. Modelled on portfolio-infra/scripts/harden-repo.sh
 # minus the deployment environment, which this repo does not need.
 #
 #   1. Security features: Dependabot alerts + security updates, secret scanning
