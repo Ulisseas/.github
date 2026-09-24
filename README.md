@@ -4,7 +4,7 @@ Organization-wide defaults for `ulisseas/*` repositories.
 
 | Path | Purpose |
 |---|---|
-| `.github/workflows/ci-telemetry.yml` | Reusable workflow: exports a run's spans to Honeycomb and Grafana Cloud Traces and pushes CI metrics to Grafana Cloud Metrics (`ci_workflow_duration_seconds`, `ci_workflow_result` and, for deploys, `ci_deploy_lead_time_seconds`). Called from each repo's `telemetry.yml` on `workflow_run: completed`, so the exported run is already concluded. |
+| `.github/workflows/ci-telemetry.yml` | Reusable workflow: exports a run's spans to Honeycomb and Grafana Cloud Traces and pushes CI metrics to Grafana Cloud Metrics (`ci_workflow_duration_seconds`, `ci_workflow_result`, labelled `repo`, `workflow`, `branch`, `event` (the trigger: `push`, `pull_request`, `workflow_dispatch`, `schedule`, …), `conclusion`, `version`, `deployed_version`; and, for deploys, `ci_deploy_lead_time_seconds`). Called from each repo's `telemetry.yml` on `workflow_run: completed`, so the exported run is already concluded. |
 | `workflow-templates/` | Two starter workflows offered under **Actions → New workflow** in every org repo: `CI` (build) and `Telemetry export` (fires when CI completes and calls the reusable workflow). |
 | `profile/README.md` | The organization profile shown at github.com/ulisseas. |
 
