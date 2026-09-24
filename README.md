@@ -14,4 +14,14 @@ A deploy run (conclusion `success` with a non-empty `deployed_version`) also emi
 
 The credentials the reusable workflow reads (`HONEYCOMB_INGEST_KEY`, `GRAFANA_OTLP_TOKEN` and the `GRAFANA_OTLP_*` / `HONEYCOMB_DATASET` variables) are org-level Actions secrets and variables written by the private `portfolio-infra` repository's bootstrap. Public repos in this org inherit them; nothing needs to be configured per repo.
 
+## Versions
+
+The reusable workflow is released with semantic-release (`.github/workflows/release.yml`, config under `release` in `package.json`). Every squash-merged PR title is a conventional commit: `feat:` cuts a minor release, `fix:` a patch, `feat!:` or a `BREAKING CHANGE:` footer a major; `docs:`, `ci:` and `chore:` cut nothing. Each release is a `vX.Y.Z` tag on the merge commit plus a GitHub release with generated notes.
+
+Callers pin a release by its commit SHA, with the version as a comment, like every other action in these repos (`sha_pinning_required` is on):
+
+    uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@<commit sha> # v1.0.0
+
+Dependabot's `github-actions` updates in each caller propose the next release as a PR, so a repo adopts a change when that PR merges and can roll back by reverting it. A change that breaks callers (a renamed input or secret, a removed label) must be released as a new major. This repo's own `telemetry.yml` calls the workflow by its local path, so it always exports with its current code.
+
 Adding a repo: create it in the org, add the **Telemetry export** template and list the repo's workflow display names under `workflow_run.workflows`. See `portfolio-infra/docs/ONBOARDING.md` for the alerting and dashboard side.
