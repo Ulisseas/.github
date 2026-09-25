@@ -22,6 +22,6 @@ Callers pin a release by its commit SHA, with the version as a comment, like eve
 
     uses: ulisseas/.github/.github/workflows/ci-telemetry.yml@<commit sha> # v1.0.0
 
-Dependabot's `github-actions` updates in each caller propose the next release as a PR, so a repo adopts a change when that PR merges and can roll back by reverting it. A change that breaks callers (a renamed input or secret, a removed label) must be released as a new major. This repo's own `telemetry.yml` calls the workflow by its local path, so it always exports with its current code.
+Dependabot's `github-actions` updates in each caller propose the next release as a PR, so a repo adopts a change when that PR merges and can roll back by reverting it. A change that breaks callers (a renamed input or secret, a removed label) must be released as a new major. Dependabot titles action bumps `fix(deps): …`, so they release on merge; a PR titled `chore:`, `ci:` or `docs:` cuts nothing and ships with the next `fix:` or `feat:`. This repo's own `telemetry.yml` calls the workflow by its local path, so it always exports with its current code.
 
 Adding a repo: create it in the org, add the **Telemetry export** template and list the repo's workflow display names under `workflow_run.workflows`. See `portfolio-infra/docs/ONBOARDING.md` for the alerting and dashboard side.
