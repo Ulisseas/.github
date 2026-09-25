@@ -33,3 +33,9 @@ updates:
       actions:
         patterns: ["*"]
     labels: [dependencies, github-actions]
+    # Actions run inside ci-telemetry.yml in every caller, so a bump must ship:
+    # "fix(deps)" makes semantic-release cut a patch on merge ("chore" cuts
+    # nothing). npm updates above stay "chore": they only touch release tooling.
+    commit-message:
+      prefix: fix
+      include: scope
