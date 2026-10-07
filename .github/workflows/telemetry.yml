@@ -1,4 +1,5 @@
-# Exports every completed lint and Release run of this repo through its own
+# Exports the live state of every lint and Release run of this repo, and the
+# traces and metrics of each completed one, through its own
 # ci-telemetry workflow, referenced locally so this repo always exports with
 # its current code (callers pin a release instead). Inside the org, so
 # secrets: inherit works. Release uploads the tag it cut as deployed-version.
@@ -7,7 +8,9 @@ name: telemetry
 on:
   workflow_run:
     workflows: [lint, Release]
-    types: [completed]
+    # requested and in_progress push the live state (ci_workflow_status) for
+    # the CI status dashboard; completed also exports traces and run metrics.
+    types: [requested, in_progress, completed]
 
 permissions: {}
 
