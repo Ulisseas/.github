@@ -32,3 +32,5 @@ jobs:
           tar -xzf actionlint.tar.gz actionlint
           ./actionlint -no-color -oneline \
             .github/workflows/*.yml workflow-templates/*.yml
+      - name: ci-telemetry tests
+        run: bash tests/ci-telemetry.sh

@@ -1,18 +1,22 @@
-# Reusable workflow: export a completed workflow run as OpenTelemetry spans to
-# Honeycomb and Grafana Cloud Traces, and push CI metrics to Grafana Cloud
-# Metrics. Provisioned by nshazly/portfolio-infra; the secrets and variables it
+# Reusable workflow: push a workflow run's live state to Grafana Cloud Metrics on
+# every workflow_run event, and once the run is completed export it as
+# OpenTelemetry spans to Honeycomb and Grafana Cloud Traces and push CI metrics
+# to Grafana Cloud Metrics. Provisioned by nshazly/portfolio-infra; the secrets and variables it
 # reads are written by that repo's bootstrap at org level (public repos) or at
 # repository level (private repos outside the org).
 #
-# Call it from a small `workflow_run` workflow in each repo, so the exported run
-# is already concluded (cicd.pipeline.result is derived from the run's
-# conclusion and is omitted while the run is in progress):
+# Call it from a small `workflow_run` workflow in each repo, with types
+# requested, in_progress and completed. Every event pushes the live state;
+# traces and the run metrics are exported from the completed event only
+# (cicd.pipeline.result is null while a run is in progress):
 #
 #   name: telemetry
 #   on:
 #     workflow_run:
 #       workflows: [CI, Release]     # the workflows to export, by display name
-#       types: [completed]
+#       # requested and in_progress push the live state (ci_workflow_status) for
+#       # the CI status dashboard; completed also exports traces and run metrics.
+#       types: [requested, in_progress, completed]
 #   permissions: {}
 #   jobs:
 #     export:
@@ -40,6 +44,10 @@
 #            labels repo, workflow, branch, event, conclusion, version, deployed_version
 #            ci_deploy_lead_time_seconds (gauge) with labels repo, workflow,
 #            branch, deployed_version; deploys only (see below)
+#            ci_workflow_status (gauge, value 1 success, 2 queued, 3 running,
+#            4 cancelled, 5 other, 6 failed) and ci_workflow_run_id (gauge,
+#            value = run id), labels repo, workflow, branch, event, status,
+#            conclusion; every event
 #
 # Lead time for changes (DORA): ci_deploy_lead_time_seconds = the run's
 # completion time (updated_at, the same end as the duration gauge) minus the
@@ -65,7 +73,7 @@ on:
   workflow_call:
     inputs:
       run_id:
-        description: The completed workflow run to export (github.event.workflow_run.id from the caller).
+        description: The workflow run to export (github.event.workflow_run.id from the caller).
         type: string
         required: true
     secrets:
@@ -90,18 +98,112 @@ jobs:
     env:
       RUN_ID: ${{ inputs.run_id }}
     steps:
-      - name: Require a completed run
+      - name: Read the run state
+        id: event
         env:
           GH_TOKEN: ${{ github.token }}
+          # The caller's workflow_run action: requested, in_progress or
+          # completed. Empty when the caller has another trigger; treated as
+          # completed, which keeps the v1.0 behaviour.
+          ACTION: ${{ github.event.action }}
         run: |
-          status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .status)
-          if [ "$status" != "completed" ]; then
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+            --jq '{name, event, head_branch, status, conclusion}' > state.json
+          status=$(jq -r .status state.json)
+          conclusion=$(jq -r '.conclusion // ""' state.json)
+          action="${ACTION:-completed}"
+          if [ "$action" = "completed" ] && [ "$status" != "completed" ]; then
             echo "::error::run ${RUN_ID} is '${status}', not completed; call this workflow from a workflow_run trigger"
             exit 1
           fi
+          # Value of ci_workflow_status, ordered by severity (portfolio-infra
+          # modules/dashboards maps it): 1 success, 2 queued, 3 running,
+          # 4 cancelled, 5 other, 6 failed. Read from the API, not the event,
+          # so a late `requested` export of a finished run reports its final state.
+          case "$status" in
+            completed)
+              case "$conclusion" in
+                success) code=1 ;;
+                cancelled) code=4 ;;
+                failure|timed_out|startup_failure) code=6 ;;
+                *) code=5 ;;
+              esac ;;
+            in_progress) code=3 ;;
+            *) code=2 ;;
+          esac
+          # Traces and the run metrics (result, duration, lead time) are exported
+          # from the completed event only, so no run is ever counted twice.
+          completed=false
+          if [ "$action" = "completed" ]; then completed=true; fi
+          {
+            echo "name=$(jq -r .name state.json)"
+            echo "event=$(jq -r .event state.json)"
+            echo "branch=$(jq -r .head_branch state.json)"
+            echo "status=$status"; echo "conclusion=$conclusion"; echo "code=$code"
+            echo "completed=$completed"
+          } >> "$GITHUB_OUTPUT"
+          echo "action=$action status=$status conclusion=${conclusion:-<none>} code=$code"
+
+      - name: Build Grafana OTLP auth header
+        id: grafana
+        env:
+          INSTANCE_ID: ${{ vars.GRAFANA_OTLP_INSTANCE_ID }}
+          TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
+        run: |
+          auth=$(printf '%s:%s' "$INSTANCE_ID" "$TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          echo "auth=$auth" >> "$GITHUB_OUTPUT"
+
+      # Every event: the run's current state as ci_workflow_status (the code
+      # above) and its id as ci_workflow_run_id (the dashboard's run link), with
+      # labels repo, workflow, branch, event, status, conclusion. conclusion is
+      # empty, so absent in Prometheus, until the run completes.
+      - name: Push CI status to Grafana Cloud Metrics
+        id: status_push
+        # A failed live-state push must not skip the traces and run metrics of a
+        # completed event; its ::error annotation still shows.
+        continue-on-error: true
+        env:
+          ENDPOINT: ${{ vars.GRAFANA_OTLP_ENDPOINT }}
+          AUTH: ${{ steps.grafana.outputs.auth }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ steps.event.outputs.name }}
+          BRANCH: ${{ steps.event.outputs.branch }}
+          EVENT: ${{ steps.event.outputs.event }}
+          STATUS: ${{ steps.event.outputs.status }}
+          CONCLUSION: ${{ steps.event.outputs.conclusion }}
+          CODE: ${{ steps.event.outputs.code }}
+        run: |
+          now=$(date -u +%s%N)
+          body=$(jq -cn --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg branch "$BRANCH" --arg event "$EVENT" \
+                        --arg status "$STATUS" --arg conclusion "$CONCLUSION" --arg code "$CODE" \
+                        --arg run "$RUN_ID" --arg now "$now" '
+            [ {key:"repo",       value:{stringValue:$repo}},
+              {key:"workflow",   value:{stringValue:$workflow}},
+              {key:"branch",     value:{stringValue:$branch}},
+              {key:"event",      value:{stringValue:$event}},
+              {key:"status",     value:{stringValue:$status}},
+              {key:"conclusion", value:{stringValue:$conclusion}} ] as $attrs
+            | { resourceMetrics: [{
+                resource: { attributes: [ {key:"service.name", value:{stringValue:"github-ci"}} ] },
+                scopeMetrics: [{
+                  scope: { name: "ulisseas/.github/ci-telemetry" },
+                  metrics: [
+                    { name: "ci_workflow_status",
+                      gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: ($code|tonumber), attributes: $attrs } ] } },
+                    { name: "ci_workflow_run_id",
+                      gauge: { dataPoints: [ { timeUnixNano: $now, asDouble: ($run|tonumber), attributes: $attrs } ] } }
+                  ] }] }] }')
+          # Status code only: run logs on public repos are public.
+          http=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Basic $AUTH" -H 'Content-Type: application/json' \
+            --data "$body" "$ENDPOINT/otlp/v1/metrics" || echo 000)
+          echo "status push: HTTP $http"
+          case "$http" in 2??) ;; *) echo "::error::CI status push failed (HTTP $http)"; exit 1 ;; esac
 
       - name: Resolve run metadata and versions
         id: run
+        if: steps.event.outputs.completed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -164,6 +266,7 @@ jobs:
           echo "version=${version:-<none>} deployed_version=${deployed:-<none>} service.version=$svc_version lead_time=${lead_time:-<none>}"
 
       - name: Export trace to Honeycomb
+        if: steps.event.outputs.completed == 'true'
         uses: dash0hq/otel-cicd-action@4826b79d63662fa91657272e7711420cb6aea543 # v4.2.0
         with:
           otlpEndpoint: grpc://api.honeycomb.io:443/
@@ -173,17 +276,8 @@ jobs:
           githubToken: ${{ github.token }}
           runId: ${{ env.RUN_ID }}
 
-      - name: Build Grafana OTLP auth header
-        id: grafana
-        env:
-          INSTANCE_ID: ${{ vars.GRAFANA_OTLP_INSTANCE_ID }}
-          TOKEN: ${{ secrets.GRAFANA_OTLP_TOKEN }}
-        run: |
-          auth=$(printf '%s:%s' "$INSTANCE_ID" "$TOKEN" | base64 -w0)
-          echo "::add-mask::$auth"
-          echo "auth=$auth" >> "$GITHUB_OUTPUT"
-
       - name: Export trace to Grafana Cloud Traces
+        if: steps.event.outputs.completed == 'true'
         uses: dash0hq/otel-cicd-action@4826b79d63662fa91657272e7711420cb6aea543 # v4.2.0
         with:
           otlpEndpoint: ${{ vars.GRAFANA_OTLP_ENDPOINT }}/otlp/v1/traces
@@ -200,6 +294,7 @@ jobs:
       # carry their unit suffix and set no OTLP `unit`, so no suffix is added
       # and each Prometheus name equals the OTLP name.
       - name: Push CI metrics to Grafana Cloud Metrics
+        if: steps.event.outputs.completed == 'true'
         env:
           ENDPOINT: ${{ vars.GRAFANA_OTLP_ENDPOINT }}
           AUTH: ${{ steps.grafana.outputs.auth }}
