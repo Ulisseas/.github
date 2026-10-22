@@ -9,43 +9,82 @@
 # green. Modelled on portfolio-infra/scripts/harden-repo.sh
 # minus the deployment environment, which this repo does not need.
 #
-#   1. Security features: Dependabot alerts + security updates, secret scanning
-#      + push protection (free on public repos).
-#   2. Actions policy: GITHUB_TOKEN read-only, workflows cannot approve PRs, only
+# Preflight: before changing anything, read the workflows on the default branch
+# on GitHub and refuse to apply if the settings below would break them:
+#   - a required status check has not run there (a wrong check name blocks
+#     every merge, permanently and silently);
+#   - an action is not on the allow-list (its workflow would stop running);
+#   - an action is not pinned to a full commit SHA (with SHA pinning required,
+#     it would fail).
+#   A dry run reports the same problems and exits 1, so it doubles as an audit.
+#   Other rulesets that stack with the managed ones are listed as a note.
+#
+#   1. Pin every `uses:` in .github/workflows and workflow-templates to a commit
+#      SHA (keeps the tag as a trailing comment for Dependabot). This only
+#      rewrites the local checkout, so it runs even when the preflight refuses:
+#      merge the pins, then re-run.
+#   2. Security features: Dependabot alerts + security updates, secret scanning
+#      + push protection (free on public repos), immutable releases.
+#   3. Actions policy: GITHUB_TOKEN read-only, workflows cannot approve PRs, only
 #      GitHub-owned / verified / allow-listed actions, full-SHA pins required,
 #      and workflows from fork PRs need manual approval before they run.
-#   3. Ruleset on main: PR-only, required check "lint", linear history, no
-#      force-push, no deletion, no bypass actors.
-#   4. Repo settings: delete head branches on merge, squash-only, no wiki/projects.
-#   5. Pin every `uses:` in .github/workflows and workflow-templates to a commit
-#      SHA (keeps the tag as a trailing comment for Dependabot).
+#   4. Rulesets, no bypass actors on either:
+#      "protect-main" on main: PR-only, required check "lint", linear history,
+#      no force-push, no deletion.
+#      "protect-release-tags" on v* tags: no deletion, force-push or moving.
+#   5. Repo settings: delete head branches on merge, squash-only, no
+#      wiki/projects/discussions.
 #   6. Labels listed in .github/dependabot.yml. Dependabot ignores a label that
 #      does not exist (and a custom labels: list replaces its default
 #      "dependencies" label), so without these its PRs arrive unlabelled.
 #
-# Requirements: gh CLI authenticated as an org owner (`gh auth status`).
+# Requirements: gh CLI authenticated as an org owner (`gh auth status`), and jq.
 #   The default branch must already exist on GitHub.
 #
 # Usage:
 #   scripts/harden-repo.sh                 # apply to the repo of the current checkout
 #   scripts/harden-repo.sh owner/name      # apply to a specific repo
-#   DRY_RUN=1 scripts/harden-repo.sh       # print what would change, touch nothing
+#   DRY_RUN=1 scripts/harden-repo.sh       # audit and print what would change, touch nothing
+#   scripts/harden-repo.sh --help          # print this header
 #
 # Tunables (env):
-#   REQUIRED_CHECKS="lint"                                     space-separated job names
-#   ALLOWED_ACTION_PATTERNS="dash0hq/otel-cicd-action@*"       comma-separated third-party actions
+#   REQUIRED_CHECKS="lint"                         space-separated job names
+#   ALLOWED_ACTIONS="dash0hq/otel-cicd-action@*"   space-separated third-party action patterns
+#   RELEASE_TAG_PATTERN="refs/tags/v*"             tags the release ruleset protects
 
 set -euo pipefail
 
-REPO="${1:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+REPO=""
+for arg in "$@"; do
+  case "$arg" in
+    # Print the header comment above, whatever its length.
+    -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+    -*) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
+    *) REPO="$arg" ;;
+  esac
+done
+
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "not an OWNER/REPO: $REPO" >&2
+  exit 2
+fi
+OWNER="${REPO%%/*}"
 DRY_RUN="${DRY_RUN:-0}"
 RULESET_NAME="protect-main"
+TAG_RULESET_NAME="protect-release-tags"
+# semantic-release (.github/workflows/release.yml) tags every release vX.Y.Z,
+# and callers pin a release by that commit.
+RELEASE_TAG_PATTERN="${RELEASE_TAG_PATTERN:-refs/tags/v*}"
 # Job name in .github/workflows/lint.yml; a required-check context matches by
 # job name alone, so keep it in sync.
 read -r -a REQUIRED_CHECKS <<<"${REQUIRED_CHECKS:-lint}"
 # Third-party actions the workflows here reference. ci-telemetry.yml runs the
-# OTel exporter; everything else is GitHub-owned. SHA-pinned regardless.
-ALLOWED_ACTION_PATTERNS="${ALLOWED_ACTION_PATTERNS:-dash0hq/otel-cicd-action@*}"
+# OTel exporter; everything else is GitHub-owned. SHA-pinned regardless. The
+# policy also admits verified creators, but the preflight can't tell which
+# those are, so it wants every third-party action listed here.
+read -r -a ALLOWED_ACTIONS <<<"${ALLOWED_ACTIONS:-dash0hq/otel-cicd-action@*}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKFLOW_DIRS=("$ROOT/.github/workflows" "$ROOT/workflow-templates")
 # name|colour|description, one per line. Keep in sync with the labels: entries
@@ -63,12 +102,19 @@ skip() { printf '   dry   %s\n' "$*"; }
 note() { printf '   note  %s\n' "$*"; }
 
 FAILED=0
+PROBLEMS=()
 
 run() {   # run "description" gh args... (always returns 0 so set -e doesn't abort)
   local desc="$1"; shift
   if [[ "$DRY_RUN" == 1 ]]; then skip "$desc"; return 0; fi
   if "$@" >/dev/null; then ok "$desc"; else echo "   FAIL   $desc" >&2; FAILED=$((FAILED + 1)); fi
   return 0
+}
+
+problem() {   # problem "message": record a preflight problem once
+  local p
+  for p in ${PROBLEMS[@]+"${PROBLEMS[@]}"}; do [[ "$p" == "$1" ]] && return 0; done
+  PROBLEMS+=("$1")
 }
 
 # ------------------------------------------------------------------ preflight
@@ -85,116 +131,54 @@ if [[ "$VISIBILITY" != "PUBLIC" ]]; then
   note "repo is $VISIBILITY. A .github repo must be PUBLIC to serve reusable workflows to other"
   note "owners and to render the org profile: Settings > Danger Zone > Change visibility."
 fi
+# Every page, flattened. Includes org rulesets that apply here (source_type
+# "Organization"), which can't be edited through the repo.
+RULESETS_JSON=$(gh api --paginate "repos/$REPO/rulesets" | jq -sc 'add // []')
 
-# ---------------------------------------------------------------- 1. security
-say "Security features"
-run "Dependabot vulnerability alerts" \
-  gh api -X PUT "repos/$REPO/vulnerability-alerts"
-run "Dependabot security updates" \
-  gh api -X PUT "repos/$REPO/automated-security-fixes"
-run "Secret scanning + push protection" \
-  gh api -X PATCH "repos/$REPO" --input - <<'JSON'
-{
-  "security_and_analysis": {
-    "secret_scanning": { "status": "enabled" },
-    "secret_scanning_push_protection": { "status": "enabled" }
-  }
-}
-JSON
-
-# ---------------------------------------------------------- 2. actions policy
-say "Actions policy"
-run "GITHUB_TOKEN default permissions=read, workflows cannot approve PRs" \
-  gh api -X PUT "repos/$REPO/actions/permissions/workflow" --input - <<'JSON'
-{ "default_workflow_permissions": "read", "can_approve_pull_request_reviews": false }
-JSON
-run "allow only GitHub-owned + verified + allow-listed actions; require full-SHA pins" \
-  gh api -X PUT "repos/$REPO/actions/permissions" --input - <<'JSON'
-{ "enabled": true, "allowed_actions": "selected", "sha_pinning_required": true }
-JSON
-patterns_json=$(tr ',' '\n' <<<"$ALLOWED_ACTION_PATTERNS" | sed '/^$/d' | jq -R . | jq -sc .)
-run "allow-list patterns: $ALLOWED_ACTION_PATTERNS" \
-  gh api -X PUT "repos/$REPO/actions/permissions/selected-actions" --input - <<JSON
-{ "github_owned_allowed": true, "verified_allowed": true, "patterns_allowed": $patterns_json }
-JSON
-# On a public repo anyone can open a PR from a fork. Their workflow runs must
-# be approved by a maintainer before they execute, every time.
-run "require approval for workflows from all fork PRs" \
-  gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" --input - <<'JSON'
-{ "approval_policy": "all_external_contributors" }
-JSON
-note "Fork PRs get no secrets and cannot merge; the approval gate stops them from burning minutes or"
-note "probing the lint workflow. The reusable workflow itself only ever runs in the CALLER's context."
-
-# --------------------------------------------------------------- 3. ruleset
-say "Ruleset '$RULESET_NAME' on $DEFAULT_BRANCH"
-required_checks_json=$(printf '{ "context": "%s" },' "${REQUIRED_CHECKS[@]}")
-required_checks_json="${required_checks_json%,}"
-ruleset_json=$(cat <<JSON
-{
-  "name": "$RULESET_NAME",
-  "target": "branch",
-  "enforcement": "active",
-  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
-  "bypass_actors": [],
-  "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
-    { "type": "required_linear_history" },
-    {
-      "type": "pull_request",
-      "parameters": {
-        "required_approving_review_count": 0,
-        "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": false,
-        "require_last_push_approval": false,
-        "required_review_thread_resolution": true,
-        "allowed_merge_methods": ["squash"]
-      }
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "strict_required_status_checks_policy": true,
-        "do_not_enforce_on_create": true,
-        "required_status_checks": [ $required_checks_json ]
-      }
-    }
-  ]
-}
-JSON
-)
-existing_id=$(gh api "repos/$REPO/rulesets" --jq ".[] | select(.name==\"$RULESET_NAME\") | .id" 2>/dev/null || true)
-if [[ -n "$existing_id" ]]; then
-  run "update ruleset id=$existing_id" \
-    gh api -X PUT "repos/$REPO/rulesets/$existing_id" --input - <<<"$ruleset_json"
-else
-  run "create ruleset" \
-    gh api -X POST "repos/$REPO/rulesets" --input - <<<"$ruleset_json"
+say "Preflight: workflows on $DEFAULT_BRANCH"
+ran=$(gh api --paginate "repos/$REPO/commits/$DEFAULT_BRANCH/check-runs?per_page=100" \
+  | jq -rs '[.[].check_runs[].name] | unique | .[]')
+for check in "${REQUIRED_CHECKS[@]}"; do
+  if grep -qxF -- "$check" <<<"$ran"; then
+    ok "required check '$check' ran on $DEFAULT_BRANCH"
+  else
+    problem "required check '$check' has not run on $DEFAULT_BRANCH; checks seen: $(paste -sd, - <<<"$ran")"
+  fi
+done
+workflows=$(gh api "repos/$REPO/contents/.github/workflows?ref=$DEFAULT_BRANCH" \
+  --jq '.[] | select(.name | test("\\.ya?ml$")) | .path' 2>/dev/null || true)
+while IFS= read -r wf; do
+  [[ -n "$wf" ]] || continue
+  while IFS= read -r use; do
+    [[ "$use" == ./* || "$use" == docker://* ]] && continue
+    action="${use%%@*}"; ref="${use#*@}"; owner="${action%%/*}"
+    # GitHub-owned actions and this owner's own (e.g. ulisseas/.github's
+    # reusable workflow) are allowed without a pattern.
+    if [[ "$owner" != actions && "$owner" != github && "$owner" != "$OWNER" ]]; then
+      allowed=0
+      for pattern in ${ALLOWED_ACTIONS[@]+"${ALLOWED_ACTIONS[@]}"}; do
+        # shellcheck disable=SC2053  # the pattern is a glob on purpose
+        [[ "$use" == $pattern ]] && allowed=1
+      done
+      (( allowed )) || problem "$wf uses $use, which is not in ALLOWED_ACTIONS"
+    fi
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || problem "$wf uses $use, which is not pinned to a full commit SHA"
+  done < <(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$wf?ref=$DEFAULT_BRANCH" \
+    | sed -nE 's/^[[:space:]-]*uses:[[:space:]]*["'\'']?([^"'\''[:space:]#]+).*/\1/p')
+done <<<"$workflows"
+ok "checked actions in: $(paste -sd' ' - <<<"$workflows")"
+others=$(jq -r --arg b "$RULESET_NAME" --arg t "$TAG_RULESET_NAME" '.[]
+  | select((.source_type == "Repository" and (.name == $b or .name == $t)) | not)
+  | "\(.name) (\(.target), \(.enforcement), from \(.source_type) \(.source))"' <<<"$RULESETS_JSON")
+if [[ -n "$others" ]]; then
+  note "other rulesets also apply and stack with the managed ones (the strictest rule wins):"
+  while IFS= read -r line; do note "  $line"; done <<<"$others"
 fi
-note "required_approving_review_count=0: a solo maintainer can't approve their own PR."
-note "No bypass actors: even the owner goes through a PR. Edit the ruleset in the UI for break-glass."
-note "Callers pin this repo's workflow @main, so a merge here is a deploy to every caller."
+for p in ${PROBLEMS[@]+"${PROBLEMS[@]}"}; do echo "   PROBLEM  $p" >&2; done
 
-# ----------------------------------------------------------- 4. repo settings
-say "Repository settings"
-run "delete branch on merge, suggest branch updates, squash-only, no wiki/projects" \
-  gh api -X PATCH "repos/$REPO" --input - <<'JSON'
-{
-  "delete_branch_on_merge": true,
-  "allow_update_branch": true,
-  "allow_auto_merge": false,
-  "allow_squash_merge": true,
-  "allow_merge_commit": false,
-  "allow_rebase_merge": false,
-  "squash_merge_commit_title": "PR_TITLE",
-  "squash_merge_commit_message": "PR_BODY",
-  "has_wiki": false,
-  "has_projects": false
-}
-JSON
-
-# --------------------------------------------------------- 5. pin action SHAs
+# --------------------------------------------------------- 1. pin action SHAs
+# Local files only, so it runs before the preflight gate: an unpinned action is
+# fixed by merging this step's rewrite.
 say "Pin GitHub Actions to commit SHAs"
 CACHE_FILE=$(mktemp)
 changed=0
@@ -238,6 +222,139 @@ if (( changed )) && [[ "$DRY_RUN" != 1 ]]; then
   note "workflows rewritten; review with 'git diff' and commit on a feature branch."
 fi
 
+if (( ${#PROBLEMS[@]} )) && [[ "$DRY_RUN" != 1 ]]; then
+  echo >&2
+  echo "Refusing to apply: ${#PROBLEMS[@]} preflight problem(s) above would block merges or" >&2
+  echo "workflow runs. Fix them on $DEFAULT_BRANCH (merge any pins from step 1), then re-run." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- 2. security
+say "Security features"
+run "Dependabot vulnerability alerts" \
+  gh api -X PUT "repos/$REPO/vulnerability-alerts"
+run "Dependabot security updates" \
+  gh api -X PUT "repos/$REPO/automated-security-fixes"
+run "Secret scanning + push protection" \
+  gh api -X PATCH "repos/$REPO" --input - <<'JSON'
+{
+  "security_and_analysis": {
+    "secret_scanning": { "status": "enabled" },
+    "secret_scanning_push_protection": { "status": "enabled" }
+  }
+}
+JSON
+# A published release's tag and assets can't change. semantic-release here
+# publishes notes only; @semantic-release/github uploads any assets to a draft
+# before publishing it, so adding some later still works.
+run "Immutable releases" \
+  gh api -X PUT "repos/$REPO/immutable-releases"
+
+# ---------------------------------------------------------- 3. actions policy
+say "Actions policy"
+run "GITHUB_TOKEN default permissions=read, workflows cannot approve PRs" \
+  gh api -X PUT "repos/$REPO/actions/permissions/workflow" --input - <<'JSON'
+{ "default_workflow_permissions": "read", "can_approve_pull_request_reviews": false }
+JSON
+run "allow only GitHub-owned + verified + allow-listed actions; require full-SHA pins" \
+  gh api -X PUT "repos/$REPO/actions/permissions" --input - <<'JSON'
+{ "enabled": true, "allowed_actions": "selected", "sha_pinning_required": true }
+JSON
+selected_json=$(printf '%s\n' ${ALLOWED_ACTIONS[@]+"${ALLOWED_ACTIONS[@]}"} | sed '/^$/d' | jq -R . \
+  | jq -sc '{ github_owned_allowed: true, verified_allowed: true, patterns_allowed: . }')
+run "allow-list patterns: ${ALLOWED_ACTIONS[*]:-<none>}" \
+  gh api -X PUT "repos/$REPO/actions/permissions/selected-actions" --input - <<<"$selected_json"
+# On a public repo anyone can open a PR from a fork. Their workflow runs must
+# be approved by a maintainer before they execute, every time.
+run "require approval for workflows from all fork PRs" \
+  gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" --input - <<'JSON'
+{ "approval_policy": "all_external_contributors" }
+JSON
+note "Fork PRs get no secrets and cannot merge; the approval gate stops them from burning minutes or"
+note "probing the lint workflow. The reusable workflow itself only ever runs in the CALLER's context."
+
+# --------------------------------------------------------------- 4. rulesets
+upsert_ruleset() {   # upsert_ruleset NAME JSON: update this repo's ruleset NAME in place, or create it
+  local name="$1" body="$2" id
+  id=$(jq -r --arg n "$name" \
+    '[.[] | select(.source_type == "Repository" and .name == $n) | .id] | first // empty' <<<"$RULESETS_JSON")
+  if [[ -n "$id" ]]; then
+    run "update ruleset '$name' id=$id" \
+      gh api -X PUT "repos/$REPO/rulesets/$id" --input - <<<"$body"
+  else
+    run "create ruleset '$name'" \
+      gh api -X POST "repos/$REPO/rulesets" --input - <<<"$body"
+  fi
+}
+
+say "Ruleset '$RULESET_NAME' on $DEFAULT_BRANCH"
+required_checks_json=$(printf '%s\n' "${REQUIRED_CHECKS[@]}" | jq -R '{ context: . }' | jq -sc .)
+upsert_ruleset "$RULESET_NAME" "$(jq -n --arg name "$RULESET_NAME" --argjson checks "$required_checks_json" '{
+  name: $name,
+  target: "branch",
+  enforcement: "active",
+  conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+  bypass_actors: [],
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    { type: "required_linear_history" },
+    {
+      type: "pull_request",
+      parameters: {
+        required_approving_review_count: 0,
+        dismiss_stale_reviews_on_push: true,
+        require_code_owner_review: false,
+        require_last_push_approval: false,
+        required_review_thread_resolution: true,
+        allowed_merge_methods: ["squash"]
+      }
+    },
+    {
+      type: "required_status_checks",
+      parameters: {
+        strict_required_status_checks_policy: true,
+        do_not_enforce_on_create: true,
+        required_status_checks: $checks
+      }
+    }
+  ]
+}')"
+note "required_approving_review_count=0: a solo maintainer can't approve their own PR."
+note "No bypass actors: even the owner goes through a PR. Edit the ruleset in the UI for break-glass."
+note "Callers pin this repo's workflow @main, so a merge here is a deploy to every caller."
+
+say "Ruleset '$TAG_RULESET_NAME' on $RELEASE_TAG_PATTERN"
+upsert_ruleset "$TAG_RULESET_NAME" "$(jq -n --arg name "$TAG_RULESET_NAME" --arg pattern "$RELEASE_TAG_PATTERN" '{
+  name: $name,
+  target: "tag",
+  enforcement: "active",
+  conditions: { ref_name: { include: [$pattern], exclude: [] } },
+  bypass_actors: [],
+  rules: [{ type: "deletion" }, { type: "non_fast_forward" }, { type: "update" }]
+}')"
+note "Creating tags stays allowed, so the Release workflow can still push a new vX.Y.Z;"
+note "nothing can delete, force-push or move one once it exists."
+
+# ----------------------------------------------------------- 5. repo settings
+say "Repository settings"
+run "delete branch on merge, suggest branch updates, squash-only, no wiki/projects/discussions" \
+  gh api -X PATCH "repos/$REPO" --input - <<'JSON'
+{
+  "delete_branch_on_merge": true,
+  "allow_update_branch": true,
+  "allow_auto_merge": false,
+  "allow_squash_merge": true,
+  "allow_merge_commit": false,
+  "allow_rebase_merge": false,
+  "squash_merge_commit_title": "PR_TITLE",
+  "squash_merge_commit_message": "PR_BODY",
+  "has_wiki": false,
+  "has_projects": false,
+  "has_discussions": false
+}
+JSON
+
 # ------------------------------------------------------ 6. labels
 say "Labels referenced by .github/dependabot.yml"
 # --force updates colour and description when the label already exists, so
@@ -253,11 +370,18 @@ say "Done"
 echo "   Verify:"
 echo "     gh api repos/$REPO/rulesets --jq '.[].name'"
 echo "     gh label list --repo $REPO"
+echo "     gh api repos/$REPO/immutable-releases"
 echo "     gh api repos/$REPO/actions/permissions/fork-pr-contributor-approval"
 echo "     gh api repos/$REPO/actions/permissions/selected-actions"
 echo "     gh repo view $REPO --web   (Settings > Rules, Code security, Actions)"
 
+status=0
 if (( FAILED > 0 )); then
   echo "$FAILED step(s) FAILED — review output above" >&2
-  exit 1
+  status=1
 fi
+if (( ${#PROBLEMS[@]} )); then
+  echo "Dry run found ${#PROBLEMS[@]} preflight problem(s) above; applying will refuse until they're fixed." >&2
+  status=1
+fi
+exit "$status"
